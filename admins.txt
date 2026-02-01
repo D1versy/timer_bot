@@ -1,0 +1,4 @@
+# Список админов
+@AlphaSynth
+@GYu_li
+@d1versy
