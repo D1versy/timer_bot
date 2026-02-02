@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 from app.db import SessionLocal
-from app.models import Boss, KillLog, ServerState
+from app.models import Boss, KillLog, ServerState, Subscriber
 from app.services import now_moscow, next_spawn_at, MOSCOW
 
 load_dotenv()
@@ -37,9 +37,49 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMINS_FILE = Path(__file__).parent / "admins.txt"
-TZ = ZoneInfo("Europe/Moscow")
+TZ = ZoneInfo("Europe/Simferopol")
 
+# Кэш подписчиков (загружается из БД при старте)
 _subscribers: set[int] = set()
+
+
+def load_subscribers_from_db():
+    """Загрузить подписчиков из БД в кэш."""
+    global _subscribers
+    db = SessionLocal()
+    try:
+        subs = db.query(Subscriber).all()
+        _subscribers = {s.chat_id for s in subs}
+        logger.info(f"Загружено {len(_subscribers)} подписчиков из БД")
+    finally:
+        db.close()
+
+
+def add_subscriber(chat_id: int):
+    """Добавить подписчика в БД и кэш."""
+    if chat_id in _subscribers:
+        return
+    _subscribers.add(chat_id)
+    db = SessionLocal()
+    try:
+        exists = db.query(Subscriber).filter(Subscriber.chat_id == chat_id).first()
+        if not exists:
+            db.add(Subscriber(chat_id=chat_id))
+            db.commit()
+            logger.info(f"Новый подписчик: {chat_id}")
+    finally:
+        db.close()
+
+
+def remove_subscriber(chat_id: int):
+    """Удалить подписчика из БД и кэша."""
+    _subscribers.discard(chat_id)
+    db = SessionLocal()
+    try:
+        db.query(Subscriber).filter(Subscriber.chat_id == chat_id).delete()
+        db.commit()
+    finally:
+        db.close()
 
 
 def load_admins() -> set[str]:
@@ -219,7 +259,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 ━━━━━━━━━━━━━━━━━━━━
 
 💡 *Время: Simferopol (UTC+3)*
+
+✅ Вы автоматически подписаны на уведомления о респах!
 """
+    # Автоматическая подписка при /help
+    add_subscriber(update.effective_chat.id)
     try:
         await update.message.reply_text(help_text, parse_mode="Markdown")
     except Exception as e:
@@ -227,12 +271,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Автоматическая подписка при /start
+    add_subscriber(update.effective_chat.id)
     await cmd_help(update, context)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    _subscribers.add(chat_id)
+    add_subscriber(chat_id)
     
     db = SessionLocal()
     try:
@@ -336,12 +382,17 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             for boss in fast_bosses:
                 spawn_time = dt + timedelta(minutes=boss.first_spawn_minutes or 0)
                 time_str = format_time_short(spawn_time)
-                message = f"🔴 Босс После рестарта через {boss.first_spawn_minutes}м:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
-                markup = make_kill_button(boss.id, boss.name)
+                message = f"🔴 После рестарта через {boss.first_spawn_minutes}м:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
                 
                 for chat_id in list(_subscribers):
                     try:
-                        await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=markup)
+                        sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
+                        # Удалить сообщение через 1 минуту
+                        context.job_queue.run_once(
+                            delete_message_job,
+                            when=60,
+                            data={"chat_id": chat_id, "message_id": sent_msg.message_id}
+                        )
                     except Exception as e:
                         logger.error(f"Не удалось отправить в {chat_id}: {e}")
                         _subscribers.discard(chat_id)
@@ -831,6 +882,37 @@ def _spawn_key(nt: datetime) -> str:
     return nt.strftime("%Y-%m-%d %H:%M") if nt else ""
 
 
+async def delete_message_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет сообщение по job_data."""
+    job_data = context.job.data
+    chat_id = job_data["chat_id"]
+    message_id = job_data["message_id"]
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.debug(f"Не удалось удалить сообщение {message_id} в чате {chat_id}: {e}")
+
+
+async def auto_kill_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Авто-kill босса через 20 секунд после появления."""
+    job_data = context.job.data
+    boss_id = job_data["boss_id"]
+    
+    db = SessionLocal()
+    try:
+        boss = db.query(Boss).filter(Boss.id == boss_id).first()
+        if not boss:
+            return
+        
+        now = datetime.now(TZ)
+        boss.last_kill_at = _naive_tz(now)
+        db.add(KillLog(boss_id=boss.id, killed_at=boss.last_kill_at, note="авто: появление"))
+        db.commit()
+        logger.info(f"Авто-kill [{boss.id}] {boss.name}")
+    finally:
+        db.close()
+
+
 async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _subscribers:
         return
@@ -861,14 +943,26 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                     _sent_notifications.add(notification_key)
                     time_str = format_time_short(nxt)
                     message = f"🔴 Босс появился:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
-                    markup = make_kill_button(boss.id, boss.name)
                     
                     for chat_id in list(_subscribers):
                         try:
-                            await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=markup)
+                            sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
+                            # Удалить сообщение через 1 минуту
+                            context.job_queue.run_once(
+                                delete_message_job,
+                                when=60,
+                                data={"chat_id": chat_id, "message_id": sent_msg.message_id}
+                            )
                         except Exception as e:
                             logger.error(f"Не удалось отправить в {chat_id}: {e}")
                             _subscribers.discard(chat_id)
+                    
+                    # Авто-kill через 20 секунд
+                    context.job_queue.run_once(
+                        auto_kill_job,
+                        when=20,
+                        data={"boss_id": boss.id}
+                    )
             else:
                 # Проверяем интервалы уведомлений (только для будущих респов)
                 for interval in intervals:
@@ -878,11 +972,16 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                             _sent_notifications.add(notification_key)
                             time_str = format_time_short(nxt)
                             message = f"⚠️ Через {interval} минут{'у' if interval == 1 else ''} респ:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
-                            markup = make_kill_button(boss.id, boss.name)
                             
                             for chat_id in list(_subscribers):
                                 try:
-                                    await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=markup)
+                                    sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
+                                    # Удалить сообщение через 1 минуту
+                                    context.job_queue.run_once(
+                                        delete_message_job,
+                                        when=60,
+                                        data={"chat_id": chat_id, "message_id": sent_msg.message_id}
+                                    )
                                 except Exception as e:
                                     logger.error(f"Не удалось отправить в {chat_id}: {e}")
                                     _subscribers.discard(chat_id)
@@ -896,6 +995,9 @@ def main() -> None:
 
     from app.db import ensure_db_exists
     ensure_db_exists()
+    
+    # Загружаем подписчиков из БД
+    load_subscribers_from_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
     

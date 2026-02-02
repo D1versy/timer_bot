@@ -32,3 +32,11 @@ class ServerState(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     server_restart_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     notification_intervals: Mapped[str | None] = mapped_column(String, nullable=True, default="15,5,1")  # минуты через запятую
+
+
+class Subscriber(Base):
+    """Подписчики на уведомления о боссах."""
+    __tablename__ = "subscribers"
+
+    chat_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subscribed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
