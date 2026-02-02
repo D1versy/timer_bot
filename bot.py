@@ -18,7 +18,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 from app.db import SessionLocal
@@ -315,8 +317,34 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     db = SessionLocal()
     try:
         set_server_restart(db, dt)
-        text = f"✅ Время рестарта установлено: {dt.strftime('%d.%m.%Y %H:%M')}\n\n{format_list_text(db)}"
+        # Сбрасываем last_kill_at для всех боссов при рестарте
+        db.query(Boss).update({Boss.last_kill_at: None})
+        db.commit()
+        
+        # Находим боссов с first <= 5 минут и отправляем уведомления
+        fast_bosses = db.query(Boss).filter(
+            Boss.is_active,
+            Boss.first_spawn_minutes != None,
+            Boss.first_spawn_minutes <= 5
+        ).all()
+        
+        text = f"✅ Время рестарта установлено: {dt.strftime('%d.%m.%Y %H:%M')}\n🔄 Все таймеры боссов сброшены\n\n{format_list_text(db)}"
         await update.message.reply_text(text)
+        
+        # Отправляем уведомления для боссов с быстрым first всем подписчикам
+        if fast_bosses and _subscribers:
+            for boss in fast_bosses:
+                spawn_time = dt + timedelta(minutes=boss.first_spawn_minutes or 0)
+                time_str = format_time_short(spawn_time)
+                message = f"🔴 Босс После рестарта через {boss.first_spawn_minutes}м:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
+                markup = make_kill_button(boss.id, boss.name)
+                
+                for chat_id in list(_subscribers):
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=markup)
+                    except Exception as e:
+                        logger.error(f"Не удалось отправить в {chat_id}: {e}")
+                        _subscribers.discard(chat_id)
     finally:
         db.close()
 
@@ -426,23 +454,17 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 **1) Добавить босса**
 `/boss_add Тест 50% 12h 0h`
-• Тест = имя
-• 50% = шанс
-• 12h = респ после убийства (> 0!)
-• 0h = после рестарта через 1 мин
+• 12h = респ после /kill (> 0!)
+• 0h = респ после /restart (1 мин)
 
 **2) Удалить босса**
 `/boss_del 48`
 
 **3) Редактировать босса**
 `/boss_edit 48 Тест 50% 12h 0h`
-• 48 = ID
-• 12h = респ после убийства (> 0!)
-• 0h = после рестарта через 1 мин
 
 **4) Настроить уведомления**
-`/notifications 20 15 5 1` — за 20, 15, 5, 1 мин
-`/notifications 5 1` — только за 5 и 1 мин
+`/notifications 15 5 1` — за 15, 5, 1 мин
 
 **5) Админы**
 `/admin_add @username`
@@ -450,13 +472,14 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 `/admin_list`
 
 **6) Резервная копия БД**
-`/backup` — скачать файл базы данных
+`/backup` — скачать файл БД
+📎 Отправьте файл .db — восстановить БД
 
 ━━━━━━━━━━━━━━━━━━━━
 
-⚠️ **Важно:**
-• Респ после убийства: > 0
-• Респ после рестарта: 0h = 1m (сразу)
+⚠️ **Логика таймеров:**
+• `/restart` — сбрасывает все таймеры, счёт по first
+• `/kill` — записывает время, счёт по resp
 • Форматы: `10h`, `30m`, `1d`, `2h30m`
 """
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -502,6 +525,45 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
     except Exception as e:
         logger.error(f"Ошибка при отправке backup: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+
+async def handle_db_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает загруженный файл БД для восстановления."""
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ Недостаточно прав")
+        return
+    
+    document = update.message.document
+    if not document:
+        return
+    
+    # Проверяем, что файл похож на БД
+    filename = document.file_name or ""
+    if not filename.endswith(".db"):
+        await update.message.reply_text("⚠️ Отправьте файл с расширением .db для восстановления базы данных.")
+        return
+    
+    from app.db import DB_PATH
+    
+    try:
+        # Создаём резервную копию текущей БД
+        backup_path = DB_PATH + f".backup_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}"
+        if os.path.exists(DB_PATH):
+            import shutil
+            shutil.copy2(DB_PATH, backup_path)
+        
+        # Скачиваем файл
+        file = await document.get_file()
+        await file.download_to_drive(DB_PATH)
+        
+        await update.message.reply_text(
+            f"✅ База данных восстановлена из файла: {filename}\n"
+            f"📦 Резервная копия старой БД: {os.path.basename(backup_path)}\n\n"
+            f"⚠️ Перезапустите бота для применения изменений!"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при восстановлении БД: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 
@@ -788,27 +850,27 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
             key_base = _spawn_key(nxt)
             delta_m = (nxt - now).total_seconds() / 60
 
-            if delta_m <= 0:
-                # Появление
+            # Пропускаем боссов с респом в прошлом (они уже появились, ждём /kill)
+            if delta_m <= -1:
+                continue
+            
+            if -1 < delta_m <= 1:
+                # Появление (в пределах 1 минуты)
                 notification_key = (boss.id, key_base, 0)
                 if notification_key not in _sent_notifications:
                     _sent_notifications.add(notification_key)
                     time_str = format_time_short(nxt)
                     message = f"🔴 Босс появился:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
+                    markup = make_kill_button(boss.id, boss.name)
                     
                     for chat_id in list(_subscribers):
                         try:
-                            await context.bot.send_message(chat_id=chat_id, text=message)
+                            await context.bot.send_message(chat_id=chat_id, text=message, reply_markup=markup)
                         except Exception as e:
                             logger.error(f"Не удалось отправить в {chat_id}: {e}")
                             _subscribers.discard(chat_id)
-                    
-                    # Новый цикл
-                    boss.last_kill_at = _naive_tz(now)
-                    db.add(KillLog(boss_id=boss.id, killed_at=boss.last_kill_at, note="авто: появление"))
-                    db.commit()
             else:
-                # Проверяем интервалы уведомлений
+                # Проверяем интервалы уведомлений (только для будущих респов)
                 for interval in intervals:
                     if (interval - 1) <= delta_m <= (interval + 1):
                         notification_key = (boss.id, key_base, interval)
@@ -852,6 +914,9 @@ def main() -> None:
     app.add_handler(CommandHandler("admin_del", cmd_admin_del))
     app.add_handler(CommandHandler("admin_list", cmd_admin_list))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    
+    # Обработчик загрузки файлов БД
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore))
     
     app.add_handler(CallbackQueryHandler(callback_handler))
 
