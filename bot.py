@@ -224,6 +224,9 @@ def make_confirm_buttons(boss_id: int) -> InlineKeyboardMarkup:
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ Недостаточно прав")
+        return
     help_text = """
 🤖 **Команды бота**
 
@@ -271,12 +274,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ Недостаточно прав")
+        return
     # Автоматическая подписка при /start
     add_subscriber(update.effective_chat.id)
     await cmd_help(update, context)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ Недостаточно прав")
+        return
     chat_id = update.effective_chat.id
     add_subscriber(chat_id)
     
@@ -467,6 +476,9 @@ async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ Недостаточно прав")
+        return
     parts = (update.message.text or "").strip().split()
     if len(parts) < 2:
         await update.message.reply_text("Использование: /test <bossId>")
@@ -486,7 +498,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         
         now = datetime.now(TZ)
-        for i in range(1, 4):
+        for i in range(1, 2):
             test_time = now + timedelta(minutes=i)
             time_str = test_time.strftime("%H:%M")
             text = f"{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
