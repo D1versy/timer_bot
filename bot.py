@@ -449,6 +449,9 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 `/admin_del @username`
 `/admin_list`
 
+**6) Резервная копия БД**
+`/backup` — скачать файл базы данных
+
 ━━━━━━━━━━━━━━━━━━━━
 
 ⚠️ **Важно:**
@@ -476,6 +479,30 @@ async def cmd_admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     text = "👮 **Список админов:**\n\n" + "\n".join(admin_lines)
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет файл базы данных в чат."""
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ Недостаточно прав")
+        return
+    
+    from app.db import DB_PATH
+    
+    if not os.path.exists(DB_PATH):
+        await update.message.reply_text("❌ Файл базы данных не найден.")
+        return
+    
+    try:
+        with open(DB_PATH, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"app_backup_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}.db",
+                caption="📦 Резервная копия базы данных"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при отправке backup: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 
 def parse_duration(s: str) -> int | None:
@@ -824,6 +851,7 @@ def main() -> None:
     app.add_handler(CommandHandler("admin_add", cmd_admin_add))
     app.add_handler(CommandHandler("admin_del", cmd_admin_del))
     app.add_handler(CommandHandler("admin_list", cmd_admin_list))
+    app.add_handler(CommandHandler("backup", cmd_backup))
     
     app.add_handler(CallbackQueryHandler(callback_handler))
 
