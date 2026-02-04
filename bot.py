@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram-бот для отслеживания респаунов рейд-боссов L2M.
-Время по Simferopol (UTC+3). Токен из .env файла, админы из admins.txt.
+Время по Moscow (UTC+3). Токен из .env файла, админы из admins.txt.
 """
 import os
 import re
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMINS_FILE = Path(__file__).parent / "admins.txt"
-TZ = ZoneInfo("Europe/Simferopol")
+TZ = ZoneInfo("Europe/Moscow")
 
 # Кэш подписчиков (загружается из БД при старте)
 _subscribers: set[int] = set()
@@ -157,12 +157,14 @@ def set_notification_intervals(db, intervals: list[int]):
     db.commit()
 
 
-def boss_next_spawn(boss: Boss, server_restart_at: datetime | None) -> datetime | None:
+def boss_next_spawn(boss: Boss, server_restart_at: datetime | None, now: datetime | None = None) -> datetime | None:
+    """Рассчитать следующий респ босса с учётом догонки до текущего времени."""
     return next_spawn_at(
         _aware_tz(boss.last_kill_at),
         server_restart_at,
         boss.first_spawn_minutes,
         boss.respawn_minutes,
+        now=now,
     )
 
 
@@ -193,9 +195,10 @@ def format_list_text(db) -> str:
     """Список боссов: HH:MM | ID | имя | шанс% | resp 10h | first 5h"""
     restart = get_server_restart(db)
     bosses = db.query(Boss).filter(Boss.is_active).order_by(Boss.id).all()
+    now = datetime.now(TZ)
     rows = []
     for b in bosses:
-        nxt = boss_next_spawn(b, restart)
+        nxt = boss_next_spawn(b, restart, now=now)
         time_str = format_time_short(nxt)
         interval_str = format_respawn_interval(b.respawn_minutes)
         first_str = format_respawn_interval(b.first_spawn_minutes) if b.first_spawn_minutes is not None else "—"
@@ -224,9 +227,6 @@ def make_confirm_buttons(boss_id: int) -> InlineKeyboardMarkup:
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ Недостаточно прав")
-        return
     help_text = """
 🤖 **Команды бота**
 
@@ -261,7 +261,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 ━━━━━━━━━━━━━━━━━━━━
 
-💡 *Время: Simferopol (UTC+3)*
+💡 *Время: Moscow (UTC+3)*
 
 ✅ Вы автоматически подписаны на уведомления о респах!
 """
@@ -274,18 +274,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ Недостаточно прав")
-        return
     # Автоматическая подписка при /start
     add_subscriber(update.effective_chat.id)
     await cmd_help(update, context)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ Недостаточно прав")
-        return
     chat_id = update.effective_chat.id
     add_subscriber(chat_id)
     
@@ -376,35 +370,37 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         db.query(Boss).update({Boss.last_kill_at: None})
         db.commit()
         
-        # Находим боссов с first <= 5 минут и отправляем уведомления
+        text = f"✅ Время рестарта установлено: {dt.strftime('%d.%m.%Y %H:%M')}\n🔄 Все таймеры боссов сброшены\n\n{format_list_text(db)}"
+        await update.message.reply_text(text)
+        
+        # Уведомления о быстрых боссах (first <= 5 минут) — только если их первое появление ещё в будущем
+        now = datetime.now(TZ)
         fast_bosses = db.query(Boss).filter(
             Boss.is_active,
             Boss.first_spawn_minutes != None,
             Boss.first_spawn_minutes <= 5
         ).all()
         
-        text = f"✅ Время рестарта установлено: {dt.strftime('%d.%m.%Y %H:%M')}\n🔄 Все таймеры боссов сброшены\n\n{format_list_text(db)}"
-        await update.message.reply_text(text)
-        
-        # Отправляем уведомления для боссов с быстрым first всем подписчикам
         if fast_bosses and _subscribers:
             for boss in fast_bosses:
                 spawn_time = dt + timedelta(minutes=boss.first_spawn_minutes or 0)
-                time_str = format_time_short(spawn_time)
-                message = f"🔴 После рестарта через {boss.first_spawn_minutes}м:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
-                
-                for chat_id in list(_subscribers):
-                    try:
-                        sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
-                        # Удалить сообщение через 4 минуты
-                        context.job_queue.run_once(
-                            delete_message_job,
-                            when=240,
-                            data={"chat_id": chat_id, "message_id": sent_msg.message_id}
-                        )
-                    except Exception as e:
-                        logger.error(f"Не удалось отправить в {chat_id}: {e}")
-                        _subscribers.discard(chat_id)
+                # Отправляем уведомление только если spawn_time в будущем (или очень близко)
+                if spawn_time >= now - timedelta(minutes=1):
+                    time_str = format_time_short(spawn_time)
+                    message = f"🔴 После рестарта через {boss.first_spawn_minutes}м:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
+                    
+                    for chat_id in list(_subscribers):
+                        try:
+                            sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
+                            # Удалить сообщение через 1 минуту
+                            context.job_queue.run_once(
+                                delete_message_job,
+                                when=60,
+                                data={"chat_id": chat_id, "message_id": sent_msg.message_id}
+                            )
+                        except Exception as e:
+                            logger.error(f"Не удалось отправить в {chat_id}: {e}")
+                            _subscribers.discard(chat_id)
     finally:
         db.close()
 
@@ -476,9 +472,6 @@ async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ Недостаточно прав")
-        return
     parts = (update.message.text or "").strip().split()
     if len(parts) < 2:
         await update.message.reply_text("Использование: /test <bossId>")
@@ -498,7 +491,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         
         now = datetime.now(TZ)
-        for i in range(1, 2):
+        for i in range(1, 4):
             test_time = now + timedelta(minutes=i)
             time_str = test_time.strftime("%H:%M")
             text = f"{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
@@ -937,19 +930,20 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
         now = datetime.now(TZ)
 
         for boss in bosses:
-            nxt = boss_next_spawn(boss, restart)
+            nxt = boss_next_spawn(boss, restart, now=now)
             if nxt is None:
                 continue
             
             key_base = _spawn_key(nxt)
             delta_m = (nxt - now).total_seconds() / 60
 
-            # Пропускаем боссов с респом в прошлом (они уже появились, ждём /kill)
-            if delta_m <= -1:
+            # Пропускаем боссов с респом более 2 минут в прошлом.
+            # next_spawn_at не догоняет респы в пределах 2 минут, чтобы мы успели отправить уведомление.
+            if delta_m <= -2:
                 continue
             
-            if -1 < delta_m <= 1:
-                # Появление (в пределах 1 минуты)
+            if -2 < delta_m <= 1:
+                # Появление (в пределах 2 минут в прошлом или 1 минуты в будущем)
                 notification_key = (boss.id, key_base, 0)
                 if notification_key not in _sent_notifications:
                     _sent_notifications.add(notification_key)
@@ -959,10 +953,10 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                     for chat_id in list(_subscribers):
                         try:
                             sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
-                            # Удалить сообщение через 4 минуты
+                            # Удалить сообщение через 1 минуту
                             context.job_queue.run_once(
                                 delete_message_job,
-                                when=240,
+                                when=60,
                                 data={"chat_id": chat_id, "message_id": sent_msg.message_id}
                             )
                         except Exception as e:
@@ -988,10 +982,10 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                             for chat_id in list(_subscribers):
                                 try:
                                     sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
-                                    # Удалить сообщение через 5 минут
+                                    # Удалить сообщение через 1 минуту
                                     context.job_queue.run_once(
                                         delete_message_job,
-                                        when=300,
+                                        when=60,
                                         data={"chat_id": chat_id, "message_id": sent_msg.message_id}
                                     )
                                 except Exception as e:

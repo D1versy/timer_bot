@@ -1,4 +1,7 @@
 # Список админов
 @AlphaSynth
+@Dawnitto
 @GYu_li
+@IKernis
 @d1versy
+@tssubach
