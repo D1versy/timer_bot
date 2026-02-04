@@ -392,10 +392,10 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     for chat_id in list(_subscribers):
                         try:
                             sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
-                            # Удалить сообщение через 1 минуту
+                            # Удалить сообщение через 4 минут
                             context.job_queue.run_once(
                                 delete_message_job,
-                                when=60,
+                                when=240,
                                 data={"chat_id": chat_id, "message_id": sent_msg.message_id}
                             )
                         except Exception as e:
@@ -953,10 +953,10 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                     for chat_id in list(_subscribers):
                         try:
                             sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
-                            # Удалить сообщение через 1 минуту
+                            # Удалить сообщение через 4 минут
                             context.job_queue.run_once(
                                 delete_message_job,
-                                when=60,
+                                when=240,
                                 data={"chat_id": chat_id, "message_id": sent_msg.message_id}
                             )
                         except Exception as e:
@@ -982,10 +982,10 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                             for chat_id in list(_subscribers):
                                 try:
                                     sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
-                                    # Удалить сообщение через 1 минуту
+                                    # Удалить сообщение через 5 минут
                                     context.job_queue.run_once(
                                         delete_message_job,
-                                        when=60,
+                                        when=300,
                                         data={"chat_id": chat_id, "message_id": sent_msg.message_id}
                                     )
                                 except Exception as e:
