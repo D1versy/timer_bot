@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
+    AIORateLimiter,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
@@ -400,7 +401,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                             )
                         except Exception as e:
                             logger.error(f"Не удалось отправить в {chat_id}: {e}")
-                            _subscribers.discard(chat_id)
+                            # _subscribers.discard(chat_id)
     finally:
         db.close()
 
@@ -961,7 +962,7 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                             )
                         except Exception as e:
                             logger.error(f"Не удалось отправить в {chat_id}: {e}")
-                            _subscribers.discard(chat_id)
+                            # _subscribers.discard(chat_id)
                     
                     # Авто-kill через 20 секунд
                     context.job_queue.run_once(
@@ -990,7 +991,7 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                                     )
                                 except Exception as e:
                                     logger.error(f"Не удалось отправить в {chat_id}: {e}")
-                                    _subscribers.discard(chat_id)
+                                    # _subscribers.discard(chat_id)
     finally:
         db.close()
 
@@ -1005,7 +1006,12 @@ def main() -> None:
     # Загружаем подписчиков из БД
     load_subscribers_from_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .rate_limiter(AIORateLimiter(max_retries=3))
+        .build()
+    )
     
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_start))
